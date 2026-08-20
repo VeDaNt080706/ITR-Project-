@@ -3,6 +3,8 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -30,6 +32,30 @@ const (
 	colorBold    = "\033[1m"
 )
 
+var jsonMode bool
+
+// JSONEvent is the structured payload for --json mode
+type JSONEvent struct {
+	Type        string `json:"type"`
+	Timestamp   string `json:"timestamp"`
+	File        string `json:"file,omitempty"`
+	Source      string `json:"source,omitempty"`
+	Destination string `json:"destination,omitempty"`
+	Size        string `json:"size,omitempty"`
+	FileType    string `json:"fileType,omitempty"`
+	Message     string `json:"message,omitempty"`
+	IsExternal  bool   `json:"isExternal,omitempty"`
+}
+
+func emitJSON(event JSONEvent) {
+	data, err := json.Marshal(event)
+	if err != nil {
+		return
+	}
+	fmt.Println(string(data))
+	_ = os.Stdout.Sync()
+}
+
 // FileMetadata tracks the known state of a file
 type FileMetadata struct {
 	Path        string
@@ -37,7 +63,7 @@ type FileMetadata struct {
 	ModTime     time.Time
 	Hash        string
 	LastUpdated time.Time
-	Logged      bool // true once CREATE, COPY, or MOVE has been announced
+	Logged      bool
 }
 
 // PendingEvent tracks recent filesystem operations for correlation
@@ -52,16 +78,17 @@ type PendingEvent struct {
 
 // FileMonitor manages directory watching and event correlation
 type FileMonitor struct {
-	watcher         *fsnotify.Watcher
-	mu              sync.RWMutex
-	fileCache       map[string]*FileMetadata // path -> metadata
-	recentRemovals  map[string]*PendingEvent // path -> PendingEvent
-	recentRenames   map[string]*PendingEvent // oldPath -> PendingEvent
-	recentCreates   map[string]*PendingEvent // newPath -> PendingEvent
-	newlyCreated    map[string]time.Time     // path -> time created
-	activeDebounces map[string]*time.Timer   // path -> debounce timer
-	watchedFolders  []string
-	systemDrive     string
+	watcher          *fsnotify.Watcher
+	mu               sync.RWMutex
+	fileCache        map[string]*FileMetadata
+	recentRemovals   map[string]*PendingEvent
+	recentRenames    map[string]*PendingEvent
+	recentCreates    map[string]*PendingEvent
+	newlyCreated     map[string]time.Time
+	activeDebounces  map[string]*time.Timer
+	recentEmitted    map[string]time.Time // Deduplication cache: "OP:PATH" -> timestamp
+	watchedFolders   []string
+	systemDrive      string
 }
 
 func initConsole() {
@@ -77,6 +104,9 @@ func initConsole() {
 }
 
 func logMessage(format string, a ...interface{}) {
+	if jsonMode {
+		return // In JSON mode, only emitJSON is used
+	}
 	fmt.Printf(format, a...)
 	_ = os.Stdout.Sync()
 }
@@ -126,7 +156,7 @@ func shouldSkipDir(name string) bool {
 	case "node_modules", "vendor", "$recycle.bin", "system volume information",
 		"recovery", "windows", "program files", "program files (x86)",
 		"programdata", "perflogs", "msocache", "config.msi",
-		"boot", "mingw", "go":
+		"boot", "mingw", "go", ".git":
 		return true
 	}
 	if strings.HasPrefix(name, ".") && len(name) > 1 {
@@ -189,6 +219,19 @@ func (m *FileMonitor) isExternalDevice(path string) bool {
 	return false
 }
 
+// isDuplicateEvent checks if an identical event was emitted within the last 1.5s
+func (m *FileMonitor) isDuplicateEvent(op string, path string) bool {
+	key := fmt.Sprintf("%s:%s", op, strings.ToLower(path))
+	now := time.Now()
+	if lastTime, exists := m.recentEmitted[key]; exists {
+		if now.Sub(lastTime) < 1500*time.Millisecond {
+			return true
+		}
+	}
+	m.recentEmitted[key] = now
+	return false
+}
+
 func getAvailableNonSystemDrives(systemDrive string) []string {
 	bitmask, err := windows.GetLogicalDrives()
 	if err != nil {
@@ -225,6 +268,7 @@ func NewFileMonitor(folders []string) (*FileMonitor, error) {
 		recentCreates:   make(map[string]*PendingEvent),
 		newlyCreated:    make(map[string]time.Time),
 		activeDebounces: make(map[string]*time.Timer),
+		recentEmitted:   make(map[string]time.Time),
 		watchedFolders:  folders,
 		systemDrive:     systemDrive,
 	}, nil
@@ -260,7 +304,7 @@ func (m *FileMonitor) walkAndWatch(root string, maxDepth int) {
 				Size:        info.Size(),
 				ModTime:     info.ModTime(),
 				LastUpdated: time.Now(),
-				Logged:      true, // Initial existing files are marked as logged
+				Logged:      true,
 			}
 			m.mu.Unlock()
 		}
@@ -286,7 +330,7 @@ func (m *FileMonitor) SetupWatching() {
 func (m *FileMonitor) StartEventLoop() {
 	// Cleanup routine for expired pending events
 	go func() {
-		ticker := time.NewTicker(2 * time.Second)
+		ticker := time.NewTicker(3 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
 			m.mu.Lock()
@@ -309,6 +353,11 @@ func (m *FileMonitor) StartEventLoop() {
 			for k, t := range m.newlyCreated {
 				if now.Sub(t) > 10*time.Second {
 					delete(m.newlyCreated, k)
+				}
+			}
+			for k, t := range m.recentEmitted {
+				if now.Sub(t) > 5*time.Second {
+					delete(m.recentEmitted, k)
 				}
 			}
 			m.mu.Unlock()
@@ -419,12 +468,18 @@ func (m *FileMonitor) handleRemoveOp(removedPath string) {
 			removalEv.Detected = true
 			createEv.Detected = true
 			ts := getTimestamp()
+			isExt := m.isExternalDevice(createPath)
 			statusLine := ""
-			if m.isExternalDevice(createPath) {
+			if isExt {
 				statusLine = "  Status: ✓ External Device (USB)\n"
 			}
-			logMessage("\n[%s] %sMOVE DETECTED%s\n  Source: %s\n  Destination: %s\n  File Size: %s\n%s",
-				ts, colorYellow, colorReset, removedPath, createPath, formatBytes(createEv.Size), statusLine)
+			if !m.isDuplicateEvent("MOVE", removedPath+":"+createPath) {
+				logMessage("\n[%s] %sMOVE DETECTED%s\n  Source: %s\n  Destination: %s\n  File Size: %s\n%s",
+					ts, colorYellow, colorReset, removedPath, createPath, formatBytes(createEv.Size), statusLine)
+				if jsonMode {
+					emitJSON(JSONEvent{Type: "MOVE", Timestamp: ts, Source: removedPath, Destination: createPath, Size: formatBytes(createEv.Size), IsExternal: isExt})
+				}
+			}
 			m.mu.Unlock()
 			return
 		}
@@ -432,15 +487,21 @@ func (m *FileMonitor) handleRemoveOp(removedPath string) {
 	m.mu.Unlock()
 
 	// Wait briefly to see if this removal is part of a MOVE or RENAME operation
-	time.AfterFunc(500*time.Millisecond, func() {
+	time.AfterFunc(600*time.Millisecond, func() {
 		m.mu.Lock()
 		defer m.mu.Unlock()
 		if removalEv.Detected {
 			return
 		}
 		removalEv.Detected = true
-		logMessage("\n[%s] %sDELETE DETECTED%s\n  File: %s\n  File Size: %s\n",
-			getTimestamp(), colorRed, colorReset, removedPath, formatBytes(size))
+		ts := getTimestamp()
+		if !m.isDuplicateEvent("DELETE", removedPath) {
+			logMessage("\n[%s] %sDELETE DETECTED%s\n  File: %s\n  File Size: %s\n",
+				ts, colorRed, colorReset, removedPath, formatBytes(size))
+			if jsonMode {
+				emitJSON(JSONEvent{Type: "DELETE", Timestamp: ts, File: removedPath, Size: formatBytes(size)})
+			}
+		}
 	})
 }
 
@@ -450,8 +511,7 @@ func (m *FileMonitor) handleWriteOrCreateOp(path string) {
 	if timer, exists := m.activeDebounces[path]; exists && timer != nil {
 		timer.Stop()
 	}
-	// 400ms debounce gives Windows Explorer time to complete streaming bytes
-	m.activeDebounces[path] = time.AfterFunc(400*time.Millisecond, func() {
+	m.activeDebounces[path] = time.AfterFunc(500*time.Millisecond, func() {
 		m.mu.Lock()
 		delete(m.activeDebounces, path)
 		m.mu.Unlock()
@@ -468,13 +528,11 @@ func (m *FileMonitor) processSettledFile(path string) {
 
 	size := fi.Size()
 
-	// If the file is still 0 bytes and was just created, wait one more cycle for writes to start
 	m.mu.RLock()
 	createdTime, wasJustCreated := m.newlyCreated[path]
 	m.mu.RUnlock()
 
 	if size == 0 && wasJustCreated && time.Since(createdTime) < 1500*time.Millisecond {
-		// Postpone slightly to allow file stream to begin
 		m.mu.Lock()
 		m.activeDebounces[path] = time.AfterFunc(500*time.Millisecond, func() {
 			m.mu.Lock()
@@ -524,15 +582,26 @@ func (m *FileMonitor) processSettledFile(path string) {
 		ts := getTimestamp()
 
 		if isSameDir {
-			logMessage("\n[%s] %sRENAME DETECTED%s\n  Old Name: %s\n  New Name: %s\n  Path: %s%c\n",
-				ts, colorCyan, colorReset, filepath.Base(oldPath), filepath.Base(path), newDir, filepath.Separator)
+			if !m.isDuplicateEvent("RENAME", path) {
+				logMessage("\n[%s] %sRENAME DETECTED%s\n  Old Name: %s\n  New Name: %s\n  Path: %s%c\n",
+					ts, colorCyan, colorReset, filepath.Base(oldPath), filepath.Base(path), newDir, filepath.Separator)
+				if jsonMode {
+					emitJSON(JSONEvent{Type: "RENAME", Timestamp: ts, File: filepath.Base(path), Message: filepath.Base(oldPath) + " → " + filepath.Base(path) + " in " + newDir})
+				}
+			}
 		} else {
+			isExt := m.isExternalDevice(path)
 			statusLine := ""
-			if m.isExternalDevice(path) {
+			if isExt {
 				statusLine = "  Status: ✓ External Device (USB)\n"
 			}
-			logMessage("\n[%s] %sMOVE DETECTED%s\n  Source: %s\n  Destination: %s\n  File Size: %s\n%s",
-				ts, colorYellow, colorReset, oldPath, path, formatBytes(size), statusLine)
+			if !m.isDuplicateEvent("MOVE", oldPath+":"+path) {
+				logMessage("\n[%s] %sMOVE DETECTED%s\n  Source: %s\n  Destination: %s\n  File Size: %s\n%s",
+					ts, colorYellow, colorReset, oldPath, path, formatBytes(size), statusLine)
+				if jsonMode {
+					emitJSON(JSONEvent{Type: "MOVE", Timestamp: ts, Source: oldPath, Destination: path, Size: formatBytes(size), IsExternal: isExt})
+				}
+			}
 		}
 		return
 	}
@@ -556,15 +625,26 @@ func (m *FileMonitor) processSettledFile(path string) {
 			ts := getTimestamp()
 
 			if strings.EqualFold(filepath.Dir(oldPath), filepath.Dir(path)) && !isSameName {
-				logMessage("\n[%s] %sRENAME DETECTED%s\n  Old Name: %s\n  New Name: %s\n  Path: %s%c\n",
-					ts, colorCyan, colorReset, filepath.Base(oldPath), filepath.Base(path), filepath.Dir(path), filepath.Separator)
+				if !m.isDuplicateEvent("RENAME", path) {
+					logMessage("\n[%s] %sRENAME DETECTED%s\n  Old Name: %s\n  New Name: %s\n  Path: %s%c\n",
+						ts, colorCyan, colorReset, filepath.Base(oldPath), filepath.Base(path), filepath.Dir(path), filepath.Separator)
+					if jsonMode {
+						emitJSON(JSONEvent{Type: "RENAME", Timestamp: ts, File: filepath.Base(path), Message: filepath.Base(oldPath) + " → " + filepath.Base(path) + " in " + filepath.Dir(path)})
+					}
+				}
 			} else {
+				isExt := m.isExternalDevice(path)
 				statusLine := ""
-				if m.isExternalDevice(path) {
+				if isExt {
 					statusLine = "  Status: ✓ External Device (USB)\n"
 				}
-				logMessage("\n[%s] %sMOVE DETECTED%s\n  Source: %s\n  Destination: %s\n  File Size: %s\n%s",
-					ts, colorYellow, colorReset, oldPath, path, formatBytes(size), statusLine)
+				if !m.isDuplicateEvent("MOVE", oldPath+":"+path) {
+					logMessage("\n[%s] %sMOVE DETECTED%s\n  Source: %s\n  Destination: %s\n  File Size: %s\n%s",
+						ts, colorYellow, colorReset, oldPath, path, formatBytes(size), statusLine)
+					if jsonMode {
+						emitJSON(JSONEvent{Type: "MOVE", Timestamp: ts, Source: oldPath, Destination: path, Size: formatBytes(size), IsExternal: isExt})
+					}
+				}
 			}
 			return
 		}
@@ -577,15 +657,21 @@ func (m *FileMonitor) processSettledFile(path string) {
 	if !isNewFile && wasCached && cached != nil && cached.Logged {
 		if cached.Size != size || (hash != "" && cached.Hash != "" && cached.Hash != hash) {
 			m.fileCache[path] = &FileMetadata{Path: path, Size: size, ModTime: fi.ModTime(), Hash: hash, LastUpdated: now, Logged: true}
-			logMessage("\n[%s] %sMODIFY DETECTED%s\n  File: %s\n  File Size: %s\n",
-				getTimestamp(), colorMagenta, colorReset, path, formatBytes(size))
+			ts := getTimestamp()
+			if !m.isDuplicateEvent("MODIFY", path) {
+				logMessage("\n[%s] %sMODIFY DETECTED%s\n  File: %s\n  File Size: %s\n",
+					ts, colorMagenta, colorReset, path, formatBytes(size))
+				if jsonMode {
+					emitJSON(JSONEvent{Type: "MODIFY", Timestamp: ts, File: path, Size: formatBytes(size)})
+				}
+			}
 		} else {
 			m.fileCache[path] = &FileMetadata{Path: path, Size: size, ModTime: fi.ModTime(), Hash: hash, LastUpdated: now, Logged: true}
 		}
 		return
 	}
 
-	// --- Check 4: COPY detection (newly created file matching an existing file) ---
+	// --- Check 4: COPY detection ---
 	var copySourcePath string
 	destBase := strings.ToLower(filepath.Base(path))
 	destExt := strings.ToLower(filepath.Ext(path))
@@ -641,22 +727,41 @@ func (m *FileMonitor) processSettledFile(path string) {
 		if ev, ok := m.recentCreates[path]; ok {
 			ev.Detected = true
 		}
-		logMessage("\n[%s] %sCOPY DETECTED%s\n  Source: %s\n  Destination: %s\n  File Size: %s\n  File Type: %s\n",
-			ts, colorGreen, colorReset, copySourcePath, path, formatBytes(size), ext)
+		if !m.isDuplicateEvent("COPY", path) {
+			logMessage("\n[%s] %sCOPY DETECTED%s\n  Source: %s\n  Destination: %s\n  File Size: %s\n  File Type: %s\n",
+				ts, colorGreen, colorReset, copySourcePath, path, formatBytes(size), ext)
+			if jsonMode {
+				emitJSON(JSONEvent{Type: "COPY", Timestamp: ts, Source: copySourcePath, Destination: path, Size: formatBytes(size), FileType: ext})
+			}
+		}
 		return
 	}
 
 	// --- Check 5: Plain CREATE DETECTED ---
-	logMessage("\n[%s] %sCREATE DETECTED%s\n  File: %s\n  File Size: %s\n",
-		ts, colorBlue, colorReset, path, formatBytes(size))
+	if !m.isDuplicateEvent("CREATE", path) {
+		logMessage("\n[%s] %sCREATE DETECTED%s\n  File: %s\n  File Size: %s\n",
+			ts, colorBlue, colorReset, path, formatBytes(size))
+		if jsonMode {
+			emitJSON(JSONEvent{Type: "CREATE", Timestamp: ts, File: path, Size: formatBytes(size), FileType: ext})
+		}
+	}
 }
 
 func main() {
-	initConsole()
+	flag.BoolVar(&jsonMode, "json", false, "Output events as JSON lines to stdout (for dashboard integration)")
+	flag.Parse()
+
+	if !jsonMode {
+		initConsole()
+	}
 
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
-		logMessage("%s[Error]%s Failed to detect user home directory: %v\n", colorRed, colorReset, err)
+		if jsonMode {
+			emitJSON(JSONEvent{Type: "ERROR", Timestamp: getTimestamp(), Message: "Failed to detect user home directory"})
+		} else {
+			logMessage("%s[Error]%s Failed to detect user home directory: %v\n", colorRed, colorReset, err)
+		}
 		os.Exit(1)
 	}
 
@@ -665,16 +770,23 @@ func main() {
 		systemDrive = "C:"
 	}
 
-	// User standard folders on system drive
+	// Standard user profile paths
 	potentialFolders := []string{
 		filepath.Join(homeDir, "Downloads"),
 		filepath.Join(homeDir, "Pictures"),
 		filepath.Join(homeDir, "Videos"),
 		filepath.Join(homeDir, "Documents"),
 		filepath.Join(homeDir, "Desktop"),
-		filepath.Join(homeDir, "OneDrive", "Pictures"),
-		filepath.Join(homeDir, "OneDrive", "Documents"),
-		filepath.Join(homeDir, "OneDrive", "Desktop"),
+	}
+
+	// Only add OneDrive paths if they exist and are distinct
+	oneDriveRoot := filepath.Join(homeDir, "OneDrive")
+	if _, err := os.Stat(oneDriveRoot); err == nil {
+		potentialFolders = append(potentialFolders,
+			filepath.Join(oneDriveRoot, "Pictures"),
+			filepath.Join(oneDriveRoot, "Documents"),
+			filepath.Join(oneDriveRoot, "Desktop"),
+		)
 	}
 
 	// Add all non-system drive roots (D:\, E:\, G:\, H:\ etc.)
@@ -695,13 +807,21 @@ func main() {
 	}
 
 	if len(activeFolders) == 0 {
-		logMessage("%s[Error]%s No valid directories or drives found to monitor.\n", colorRed, colorReset)
+		if jsonMode {
+			emitJSON(JSONEvent{Type: "ERROR", Timestamp: getTimestamp(), Message: "No valid directories or drives found to monitor"})
+		} else {
+			logMessage("%s[Error]%s No valid directories or drives found to monitor.\n", colorRed, colorReset)
+		}
 		os.Exit(1)
 	}
 
 	monitor, err := NewFileMonitor(activeFolders)
 	if err != nil {
-		logMessage("%s[Error]%s Failed to initialize watcher: %v\n", colorRed, colorReset, err)
+		if jsonMode {
+			emitJSON(JSONEvent{Type: "ERROR", Timestamp: getTimestamp(), Message: fmt.Sprintf("Failed to initialize watcher: %v", err)})
+		} else {
+			logMessage("%s[Error]%s Failed to initialize watcher: %v\n", colorRed, colorReset, err)
+		}
 		os.Exit(1)
 	}
 	defer monitor.watcher.Close()
@@ -709,14 +829,16 @@ func main() {
 	// Setup recursive watching & initial file cache for all folders/drives
 	monitor.SetupWatching()
 
-	// Print startup banner
-	ts := getTimestamp()
-	logMessage("[%s] %sFile System Monitor Started%s\n", ts, colorBold, colorReset)
-	for _, folder := range activeFolders {
-		display := strings.TrimRight(folder, `/\`) + `\`
-		logMessage("Watching: %s\n", display)
+	// Print startup info only for human terminal mode (never in jsonMode)
+	if !jsonMode {
+		ts := getTimestamp()
+		logMessage("[%s] %sFile System Monitor Started%s\n", ts, colorBold, colorReset)
+		for _, folder := range activeFolders {
+			display := strings.TrimRight(folder, `/\`) + `\`
+			logMessage("Watching: %s\n", display)
+		}
+		logMessage("\n%s[Listening for file system events... Press Ctrl+C to stop]%s\n", colorGray, colorReset)
 	}
-	logMessage("\n%s[Listening for file system events... Press Ctrl+C to stop]%s\n", colorGray, colorReset)
 
 	// Graceful shutdown
 	sigChan := make(chan os.Signal, 1)
@@ -725,5 +847,7 @@ func main() {
 	go monitor.StartEventLoop()
 
 	<-sigChan
-	logMessage("\n[%s] %sFile System Monitor Stopped.%s\n", getTimestamp(), colorYellow, colorReset)
+	if !jsonMode {
+		logMessage("\n[%s] %sFile System Monitor Stopped.%s\n", getTimestamp(), colorYellow, colorReset)
+	}
 }
