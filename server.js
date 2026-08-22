@@ -4,6 +4,7 @@ import { createServer } from 'http';
 import { spawn } from 'child_process';
 import { createInterface } from 'readline';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -16,6 +17,7 @@ const wss = new WebSocketServer({ server, path: '/ws' });
 // ─── State ───
 let monitorProcess = null;
 let isTracking = false;
+const systemDrive = (process.env.SystemDrive || 'C:').toUpperCase().replace(/[/\\]+$/, '');
 
 // ─── Broadcast to all WebSocket clients ───
 function broadcast(data) {
@@ -26,6 +28,108 @@ function broadcast(data) {
     }
   });
 }
+
+// ─── Fast Synchronous Drive Scanner ───
+function getConnectedDrives() {
+  const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  const found = [];
+  for (let i = 0; i < letters.length; i++) {
+    const d = letters[i] + ':\\';
+    try {
+      if (fs.existsSync(d)) {
+        found.push(d);
+      }
+    } catch (e) {
+      // ignore unready/locked drives
+    }
+  }
+  return found;
+}
+
+function getNonSystemDrives() {
+  return getConnectedDrives().filter((d) => !d.toUpperCase().startsWith(systemDrive));
+}
+
+// ─── Background USB & Removable Drive Monitor (Always Running) ───
+let knownDrives = new Set();
+
+function checkDriveChanges() {
+  const current = getConnectedDrives();
+  const currentSet = new Set(current.map((d) => d.toUpperCase()));
+
+  // Check for newly connected drives
+  for (const drive of currentSet) {
+    const driveLetter = drive.slice(0, 2);
+    if (driveLetter.toUpperCase() === systemDrive) {
+      continue;
+    }
+
+    if (!knownDrives.has(drive)) {
+      knownDrives.add(drive);
+      // Only broadcast when tracking is ON
+      if (isTracking) {
+        const ts = new Date().toLocaleString();
+        console.log(`[USB Event] Pen drive inserted: ${drive}`);
+        broadcast({
+          type: 'pen_drive_insert',
+          timestamp: ts,
+          file: drive,
+          destination: drive,
+          message: `Pen drive inserted: ${drive}`,
+          isExternal: true,
+          pen_drive_id: drive,
+          device_id: process.env.COMPUTERNAME || 'LAPTOP',
+        });
+      }
+    }
+  }
+
+  // Check for removed drives
+  for (const drive of [...knownDrives]) {
+    const driveLetter = drive.slice(0, 2);
+    if (driveLetter.toUpperCase() === systemDrive) {
+      continue;
+    }
+
+    if (!currentSet.has(drive)) {
+      knownDrives.delete(drive);
+      // Only broadcast when tracking is ON
+      if (isTracking) {
+        const ts = new Date().toLocaleString();
+        console.log(`[USB Event] Pen drive removed: ${drive}`);
+        broadcast({
+          type: 'pen_drive_eject',
+          timestamp: ts,
+          file: drive,
+          source: drive,
+          message: `Pen drive removed: ${drive}`,
+          isExternal: true,
+          pen_drive_id: drive,
+          device_id: process.env.COMPUTERNAME || 'LAPTOP',
+        });
+      }
+    }
+  }
+}
+
+function startUsbDriveWatcher() {
+  // Silently snapshot all currently connected non-system drives at startup.
+  // This prevents them from firing "insert" events just because the server started.
+  const initial = getConnectedDrives();
+  for (const d of initial) {
+    const upper = d.toUpperCase();
+    if (!upper.startsWith(systemDrive)) {
+      knownDrives.add(upper);
+    }
+  }
+  console.log(`[USB Monitor] Started. Watching for plug/unplug events on non-system drives. Initial drives: ${[...knownDrives].join(', ') || 'none'}`);
+
+  // Poll every 1 second — only broadcasts on actual change
+  setInterval(checkDriveChanges, 1000);
+}
+
+// Start USB watcher immediately
+startUsbDriveWatcher();
 
 // ─── Start the Go file monitor process ───
 function startMonitor() {
@@ -127,10 +231,29 @@ app.get('/api/status', (req, res) => {
   res.json({ tracking: isTracking });
 });
 
+app.get('/api/drives', (req, res) => {
+  const drives = getNonSystemDrives();
+  res.json({ drives });
+});
+
+app.post('/api/scan-drives', (req, res) => {
+  const drives = getNonSystemDrives();
+  // Just return the list — no broadcasting, no logging
+  res.json({ success: true, drives });
+});
+
 // ─── WebSocket connection handling ───
 wss.on('connection', (ws) => {
-  // Send current status on connect
+  // Send current tracking status on connect
   ws.send(JSON.stringify({ type: 'STATUS', tracking: isTracking }));
+
+  // Send currently attached non-system drives for display only (not logged as new events)
+  const nonSystem = getNonSystemDrives();
+  ws.send(JSON.stringify({
+    type: 'CURRENT_DRIVES',
+    drives: nonSystem,
+    displayOnly: true   // frontend uses this to show drive list, never logs to DB
+  }));
 });
 
 // ─── Cleanup on exit ───

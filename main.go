@@ -326,6 +326,115 @@ func (m *FileMonitor) SetupWatching() {
 	}
 }
 
+// StartDriveMonitor periodically checks for newly connected or removed removable/non-system drives
+func (m *FileMonitor) StartDriveMonitor() {
+	go func() {
+		knownDrives := make(map[string]bool)
+		m.mu.RLock()
+		for _, folder := range m.watchedFolders {
+			if isDriveRoot(folder) {
+				clean := strings.ToUpper(strings.TrimRight(folder, `/\`)) + `\`
+				knownDrives[clean] = true
+			}
+		}
+		m.mu.RUnlock()
+
+		// Discover existing drives on initial startup
+		bitmask, err := windows.GetLogicalDrives()
+		if err == nil {
+			for i := 0; i < 26; i++ {
+				if (bitmask & (1 << uint(i))) != 0 {
+					driveLetter := fmt.Sprintf("%c:\\", 'A'+i)
+					if !strings.EqualFold(driveLetter[:2], m.systemDrive[:2]) {
+						knownDrives[strings.ToUpper(driveLetter)] = true
+					}
+				}
+			}
+		}
+
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			bitmask, err := windows.GetLogicalDrives()
+			if err != nil {
+				continue
+			}
+
+			currentDrives := make(map[string]bool)
+			for i := 0; i < 26; i++ {
+				if (bitmask & (1 << uint(i))) != 0 {
+					driveLetter := fmt.Sprintf("%c:\\", 'A'+i)
+					currentDrives[strings.ToUpper(driveLetter)] = true
+				}
+			}
+
+			// Check for new drives inserted
+			for drive := range currentDrives {
+				if strings.EqualFold(drive[:2], m.systemDrive[:2]) {
+					continue
+				}
+				if !knownDrives[drive] {
+					knownDrives[drive] = true
+
+					rootPtr, _ := syscall.UTF16PtrFromString(drive)
+					driveType := windows.GetDriveType(rootPtr)
+					isRemovable := (driveType == windows.DRIVE_REMOVABLE || driveType == windows.DRIVE_CDROM || driveType == windows.DRIVE_REMOTE || driveType == windows.DRIVE_FIXED)
+
+					if isRemovable {
+						ts := getTimestamp()
+						logMessage("\n[%s] %sPEN DRIVE INSERTED%s\n  Drive: %s\n", ts, colorMagenta, colorReset, drive)
+						if jsonMode {
+							emitJSON(JSONEvent{
+								Type:        "pen_drive_insert",
+								Timestamp:   ts,
+								File:        drive,
+								Destination: drive,
+								Message:     fmt.Sprintf("Pen drive inserted: %s", drive),
+								IsExternal:  true,
+							})
+						}
+
+						// Add watch to newly connected drive
+						m.mu.Lock()
+						m.watchedFolders = append(m.watchedFolders, drive)
+						m.mu.Unlock()
+						m.walkAndWatch(drive, 2)
+					}
+				}
+			}
+
+			// Check for removed drives
+			for drive := range knownDrives {
+				if !currentDrives[drive] {
+					delete(knownDrives, drive)
+					ts := getTimestamp()
+					logMessage("\n[%s] %sPEN DRIVE EJECTED%s\n  Drive: %s\n", ts, colorYellow, colorReset, drive)
+					if jsonMode {
+						emitJSON(JSONEvent{
+							Type:       "pen_drive_eject",
+							Timestamp:  ts,
+							File:       drive,
+							Source:     drive,
+							Message:    fmt.Sprintf("Pen drive ejected: %s", drive),
+							IsExternal: true,
+						})
+					}
+
+					// Cleanup fileCache for removed drive
+					m.mu.Lock()
+					for k := range m.fileCache {
+						if strings.HasPrefix(strings.ToUpper(k), strings.ToUpper(drive)) {
+							delete(m.fileCache, k)
+						}
+					}
+					m.mu.Unlock()
+				}
+			}
+		}
+	}()
+}
+
 // StartEventLoop processes events from fsnotify
 func (m *FileMonitor) StartEventLoop() {
 	// Cleanup routine for expired pending events
@@ -844,6 +953,7 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
+	monitor.StartDriveMonitor()
 	go monitor.StartEventLoop()
 
 	<-sigChan

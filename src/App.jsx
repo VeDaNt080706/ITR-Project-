@@ -1,8 +1,29 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import Auth from './Auth'
 import { getSupabaseClient } from './supabaseClient'
+import { logActivity, fetchActivityLogs, clearActivityLogs, setStoredUserUuid } from './supabaseLog'
 
-const EVENT_TYPES = ['create', 'copy', 'move', 'rename', 'delete', 'modify']
+const EVENT_TYPES = [
+  'create',
+  'copy',
+  'move',
+  'rename',
+  'delete',
+  'modify',
+  'pen_drive_insert',
+  'pen_drive_eject'
+]
+
+const STAT_LABELS = {
+  create: 'Creates',
+  copy: 'Copies',
+  move: 'Moves',
+  rename: 'Renames',
+  delete: 'Deletes',
+  modify: 'Modifies',
+  pen_drive_insert: 'USB In',
+  pen_drive_eject: 'USB Out',
+}
 
 const getInitialStats = () => ({
   total: 0,
@@ -12,6 +33,8 @@ const getInitialStats = () => ({
   rename: 0,
   delete: 0,
   modify: 0,
+  pen_drive_insert: 0,
+  pen_drive_eject: 0,
 })
 
 export default function App() {
@@ -22,6 +45,7 @@ export default function App() {
   const [connected, setConnected] = useState(false)
   const [reconnecting, setReconnecting] = useState(false)
   const [logs, setLogs] = useState([])
+  const [connectedDrives, setConnectedDrives] = useState([]) // currently plugged drives (display only)
   const [stats, setStats] = useState(getInitialStats())
   const [bumpKey, setBumpKey] = useState(null)
   const [toast, setToast] = useState(null)
@@ -44,7 +68,57 @@ export default function App() {
     }, 3200)
   }, [])
 
-  // ── Supabase Auth Check ──
+  // ── Load Existing Activity Logs from DB ──
+  const loadLogsFromDb = useCallback(async (userId) => {
+    if (!userId) return
+    try {
+      const rows = await fetchActivityLogs()
+
+      // If DB is empty, clear local state too
+      if (!rows || rows.length === 0) {
+        setLogs([])
+        setStats(getInitialStats())
+        return
+      }
+
+      const formatted = rows.map((row) => {
+        const details = (typeof row.details === 'object' && row.details !== null) ? row.details : {}
+        const rawAction = (row.action || 'info').toLowerCase()
+        const type = rawAction === 'file_moved' ? 'move' : rawAction
+        const ts = details.timestamp || (row.timestamp ? new Date(row.timestamp).toLocaleString() : '')
+
+        return {
+          id: row.id || `db-${Math.random()}`,
+          type: type,
+          timestamp: ts,
+          file: row.dest_path || details.file || details.destination || details.file_path || '',
+          source: row.source_path || details.source || details.source_path || '',
+          destination: row.dest_path || details.destination || details.dest_path || '',
+          size: details.size || '',
+          fileType: details.fileType || '',
+          message: details.message || (type === 'pen_drive_insert' ? `Pen drive inserted: ${row.dest_path || ''}` : type === 'pen_drive_eject' ? `Pen drive removed: ${row.source_path || ''}` : ''),
+          isExternal: Boolean(row.pen_drive_id || details.isExternal || type.includes('pen_drive') || type.includes('usb'))
+        }
+      })
+
+      setLogs(formatted)
+
+      // Recompute stats from persisted records
+      const initial = getInitialStats()
+      initial.total = formatted.length
+      formatted.forEach((item) => {
+        const t = (item.type || '').toLowerCase()
+        if (initial[t] !== undefined) {
+          initial[t] += 1
+        }
+      })
+      setStats(initial)
+    } catch (err) {
+      console.warn('Could not load activity logs from Supabase:', err.message || err)
+    }
+  }, [])
+
+  // ── Supabase Auth Check & Initial Data Hydration ──
   useEffect(() => {
     const supabase = getSupabaseClient()
     if (!supabase) {
@@ -53,8 +127,13 @@ export default function App() {
     }
 
     supabase.auth.getSession().then(({ data: { session } }) => {
-      setUser(session?.user ?? null)
+      const u = session?.user ?? null
+      setUser(u)
+      setStoredUserUuid(u?.id ?? null)
       setAuthLoading(false)
+      if (u?.id) {
+        loadLogsFromDb(u.id)
+      }
     }).catch(() => {
       setAuthLoading(false)
     })
@@ -62,22 +141,19 @@ export default function App() {
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
       const nextUser = session?.user ?? null
       setUser(nextUser)
+      setStoredUserUuid(nextUser?.id ?? null)
       setAuthLoading(false)
+      if (nextUser?.id) {
+        loadLogsFromDb(nextUser.id)
+      }
     })
 
     return () => {
       subscription.unsubscribe()
     }
-  }, [])
+  }, [loadLogsFromDb])
 
-  // ── Clean slate on login ──
-  useEffect(() => {
-    setLogs([])
-    setStats(getInitialStats())
-    recentEventsRef.current.clear()
-  }, [user?.id])
-
-  // ── Frontend Event Deduplication Check ──
+  // ── Event Deduplication Check ──
   const isDuplicate = useCallback((event) => {
     const type = (event.type || '').toUpperCase()
     const target = event.file || event.destination || event.source || ''
@@ -98,7 +174,62 @@ export default function App() {
     return false
   }, [])
 
-  // ── WebSocket Connection ──
+  // ── Process and Log Activity Event ──
+  const processEvent = useCallback((event) => {
+    const rawType = (event.type || '').toLowerCase()
+    const type = rawType === 'file_moved' ? 'move' : rawType
+
+    if (!EVENT_TYPES.includes(type)) {
+      return
+    }
+
+    if (isDuplicate(event)) {
+      return
+    }
+
+    setStats(prev => {
+      const next = { ...prev }
+      next.total = (prev.total || 0) + 1
+      if (next[type] !== undefined) {
+        next[type] = (prev[type] || 0) + 1
+      }
+      return next
+    })
+    setBumpKey(type)
+    setTimeout(() => setBumpKey(null), 250)
+
+    if (type === 'pen_drive_insert') {
+      showToast('on', 'Pen Drive Inserted', `Removable storage detected: ${event.file || event.destination || ''}`)
+    } else if (type === 'pen_drive_eject') {
+      showToast('off', 'Pen Drive Removed', `Removable storage disconnected: ${event.file || event.source || ''}`)
+    }
+
+    const newLogEntry = {
+      ...event,
+      type: type,
+      id: Date.now() + Math.random(),
+      timestamp: event.timestamp || new Date().toLocaleString()
+    }
+
+    setLogs(prev => {
+      const next = [...prev, newLogEntry]
+      return next.length > 500 ? next.slice(-500) : next
+    })
+
+    // Persist event to Supabase DB (guarded by RLS)
+    logActivity({
+      action: rawType,
+      details: event,
+      source_path: event.source || null,
+      dest_path: event.destination || event.file || null,
+      device_id: typeof window !== 'undefined' ? window.location.hostname : null,
+      pen_drive_id: (type === 'pen_drive_insert' || type === 'pen_drive_eject' || event.isExternal) ? (event.file || event.destination || 'EXTERNAL_USB') : null
+    }).catch(err => {
+      console.warn('[Supabase Log] Auto-insert note:', err.message || err)
+    })
+  }, [isDuplicate, showToast])
+
+  // ── WebSocket Connection for Live OS Events ──
   const connectWS = useCallback(() => {
     if (!user) return
 
@@ -121,28 +252,15 @@ export default function App() {
           return
         }
 
-        const type = (event.type || '').toLowerCase()
-        if (!EVENT_TYPES.includes(type)) {
+        // CURRENT_DRIVES: display-only snapshot of already-plugged drives.
+        // Do NOT call processEvent here — these drives are already known to the server;
+        // we only want real plug/unplug moments to create log entries.
+        if (event.type === 'CURRENT_DRIVES' && Array.isArray(event.drives)) {
+          setConnectedDrives(event.drives)
           return
         }
 
-        if (isDuplicate(event)) {
-          return
-        }
-
-        setStats(prev => {
-          const next = { ...prev }
-          next.total = prev.total + 1
-          if (next[type] !== undefined) next[type] = prev[type] + 1
-          return next
-        })
-        setBumpKey(type)
-        setTimeout(() => setBumpKey(null), 250)
-
-        setLogs(prev => {
-          const next = [...prev, { ...event, id: Date.now() + Math.random() }]
-          return next.length > 500 ? next.slice(-500) : next
-        })
+        processEvent(event)
       } catch (e) { /* ignore parse errors */ }
     }
 
@@ -156,7 +274,7 @@ export default function App() {
 
     ws.onerror = () => ws.close()
     wsRef.current = ws
-  }, [user, isDuplicate])
+  }, [user, processEvent])
 
   useEffect(() => {
     if (user) {
@@ -194,20 +312,28 @@ export default function App() {
       setTracking(data.tracking)
 
       if (data.tracking) {
-        showToast('on', 'Tracking ON', 'Live file monitoring is now active and recording changes.')
+        showToast('on', 'Tracking ON', 'Live file and pen drive monitoring is active.')
       } else {
-        showToast('off', 'Tracking OFF', 'File monitoring has been paused.')
+        showToast('off', 'Tracking OFF', 'File monitoring paused.')
       }
     } catch (e) {
       console.error('Toggle failed:', e)
     }
   }
 
-  // ── Clear Logs ──
-  const handleClear = () => {
-    setLogs([])
-    setStats(getInitialStats())
-    recentEventsRef.current.clear()
+
+  // ── Clear Logs (From DB and State) ──
+  const handleClear = async () => {
+    try {
+      await clearActivityLogs()
+      setLogs([])
+      setStats(getInitialStats())
+      recentEventsRef.current.clear()
+      showToast('off', 'History Cleared', 'All activity logs deleted from database.')
+    } catch (e) {
+      console.error('Failed to clear logs from DB:', e.message || e)
+      showToast('off', 'Clear Failed', `Error: ${e.message || 'Unknown error'}`)
+    }
   }
 
   // ── Sign Out ──
@@ -320,7 +446,7 @@ export default function App() {
         </div>
       </header>
 
-      {/* ── Stats ── */}
+      {/* ── Stats Bar ── */}
       <section className="stats-bar">
         <div className={`stat-card ${bumpKey === 'total' || bumpKey ? 'bump' : ''}`}>
           <div className="stat-value">{stats.total}</div>
@@ -328,8 +454,8 @@ export default function App() {
         </div>
         {EVENT_TYPES.map(type => (
           <div key={type} className={`stat-card ${bumpKey === type ? 'bump' : ''}`}>
-            <div className="stat-value">{stats[type]}</div>
-            <div className="stat-label">{type.charAt(0).toUpperCase() + type.slice(1) + 's'}</div>
+            <div className="stat-value">{stats[type] || 0}</div>
+            <div className="stat-label">{STAT_LABELS[type] || type}</div>
           </div>
         ))}
       </section>
@@ -337,13 +463,15 @@ export default function App() {
       {/* ── Log Feed ── */}
       <section className="log-feed">
         <div className="section-header">
-          <h2>Live Event Feed</h2>
-          <button className="action-btn" onClick={handleClear} title="Clear history for this session">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
-            </svg>
-            Clear History
-          </button>
+          <h2>Activity Log History (Persisted)</h2>
+          <div style={{ display: 'flex', gap: '10px' }}>
+            <button className="action-btn" onClick={handleClear} title="Clear history and delete records">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+              </svg>
+              Clear History
+            </button>
+          </div>
         </div>
 
         <div className="log-container" ref={logContainerRef} onScroll={handleScroll}>
@@ -352,14 +480,43 @@ export default function App() {
               <svg width="60" height="60" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1" strokeLinecap="round" strokeLinejoin="round" opacity="0.25">
                 <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
               </svg>
-              <p>No events recorded. Turn the toggle ON to start tracking file system activity.</p>
+              <p>No activity logs recorded. Turn Tracking ON or insert a pen drive to capture events.</p>
             </div>
           ) : (
             <div className="log-list">
               {logs.map((event) => {
                 const type = (event.type || 'INFO').toUpperCase()
+                const isUsbEvent = type === 'PEN_DRIVE_INSERT' || type === 'PEN_DRIVE_EJECT' || type === 'USB_INSERT' || type === 'USB_EJECT'
                 const hasSourceDest = (type === 'MOVE' || type === 'COPY') && (event.source && event.destination)
 
+                // 1. USB Pen Drive Insert / Eject Event
+                if (isUsbEvent) {
+                  const isInsert = type.includes('INSERT')
+                  const driveTarget = event.file || event.destination || event.source || 'Removable Drive'
+
+                  return (
+                    <div key={event.id} className="log-entry log-entry-usb external">
+                      <span className="log-timestamp">{event.timestamp}</span>
+                      <span className="log-type-badge" data-type={type}>
+                        {isInsert ? 'USB INSERT' : 'USB EJECT'}
+                      </span>
+
+                      <div className="log-path-card single-card usb-card" title={driveTarget}>
+                        <span className="path-chip usb-chip">
+                          {isInsert ? 'PEN DRIVE CONNECTED' : 'PEN DRIVE REMOVED'}
+                        </span>
+                        <span className="path-text">{driveTarget}</span>
+                        {event.message && <span className="path-meta">{event.message}</span>}
+                      </div>
+
+                      <div className="log-trailing-info">
+                        <span className="usb-badge highlight">USB</span>
+                      </div>
+                    </div>
+                  )
+                }
+
+                // 2. Transfer Operations (MOVE, COPY)
                 if (hasSourceDest) {
                   return (
                     <div key={event.id} className={`log-entry log-entry-transfer ${event.isExternal ? 'external' : ''}`}>
@@ -389,13 +546,13 @@ export default function App() {
                       {/* Trailing: Size & External badge */}
                       <div className="log-trailing-info">
                         {event.size && <span className="log-size">{event.size}</span>}
-                        {event.isExternal && <span className="usb-badge">USB</span>}
+                        {event.isExternal && <span className="usb-badge highlight">USB</span>}
                       </div>
                     </div>
                   )
                 }
 
-                // Single Target Operation (CREATE, DELETE, MODIFY, RENAME)
+                // 3. Single Target Operations (CREATE, DELETE, MODIFY, RENAME)
                 const targetPath = event.file || event.destination || event.source || ''
                 return (
                   <div key={event.id} className={`log-entry log-entry-single ${event.isExternal ? 'external' : ''}`}>
@@ -412,7 +569,7 @@ export default function App() {
 
                     <div className="log-trailing-info">
                       {event.size && <span className="log-size">{event.size}</span>}
-                      {event.isExternal && <span className="usb-badge">USB</span>}
+                      {event.isExternal && <span className="usb-badge highlight">USB</span>}
                     </div>
                   </div>
                 )

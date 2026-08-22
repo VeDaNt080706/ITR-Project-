@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "concurrently -k -n \"UI,SERVER\" -c \"cyan,yellow\" \"vite\" \"node server.js\"",
+    "dev": "concurrently -k -n \"UI,SERVER\" -c \"cyan,yellow\" \"vite\" \"node --watch server.js\"",
     "build": "vite build",
     "build:go": "go build -o fsmonitor.exe .",
     "preview": "vite preview"

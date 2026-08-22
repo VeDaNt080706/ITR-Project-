@@ -324,7 +324,7 @@ body {
    ══════════════════════════ */
 .stats-bar {
   display: grid;
-  grid-template-columns: repeat(7, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
   gap: 12px;
   padding: 20px 32px;
   border-bottom: 1px solid var(--border);
@@ -474,13 +474,17 @@ body {
   flex-shrink: 0;
 }
 
-.log-type-badge[data-type="CREATE"]  { border-color: #555; color: #ddd; }
-.log-type-badge[data-type="COPY"]    { border-color: #666; color: #fff; border-style: dashed; }
-.log-type-badge[data-type="MOVE"]    { border-color: #888; color: #fff; background: rgba(255,255,255,0.06); }
-.log-type-badge[data-type="RENAME"]  { border-color: #555; color: #ccc; border-style: dotted; }
-.log-type-badge[data-type="DELETE"]  { border-color: #777; color: #fff; }
-.log-type-badge[data-type="MODIFY"]  { border-color: #444; color: #bbb; }
-.log-type-badge[data-type="INFO"]    { border-color: #333; color: #888; }
+.log-type-badge[data-type="CREATE"]            { border-color: #555; color: #ddd; }
+.log-type-badge[data-type="COPY"]              { border-color: #666; color: #fff; border-style: dashed; }
+.log-type-badge[data-type="MOVE"]              { border-color: #888; color: #fff; background: rgba(255,255,255,0.06); }
+.log-type-badge[data-type="RENAME"]            { border-color: #555; color: #ccc; border-style: dotted; }
+.log-type-badge[data-type="DELETE"]            { border-color: #777; color: #fff; }
+.log-type-badge[data-type="MODIFY"]            { border-color: #444; color: #bbb; }
+.log-type-badge[data-type="PEN_DRIVE_INSERT"],
+.log-type-badge[data-type="USB_INSERT"]        { border-color: #fff; color: #000; background: #fff; font-weight: 800; }
+.log-type-badge[data-type="PEN_DRIVE_EJECT"],
+.log-type-badge[data-type="USB_EJECT"]         { border-color: #777; color: #bbb; background: rgba(255,255,255,0.08); }
+.log-type-badge[data-type="INFO"]              { border-color: #333; color: #888; }
 
 /* ─── Source & Destination Full-Width Cards ─── */
 .log-path-card {
@@ -588,6 +592,23 @@ body {
   border-radius: 6px;
   color: var(--text-secondary);
   font-family: var(--font-sans);
+}
+
+.usb-badge.highlight {
+  background: #fff;
+  color: #000;
+  border-color: #fff;
+  font-weight: 800;
+}
+
+.usb-card {
+  border-color: #444;
+  background: #0d0d0d;
+}
+
+.usb-chip {
+  color: #fff;
+  font-weight: 800;
 }
 
 /* ─── Empty State ─── */
