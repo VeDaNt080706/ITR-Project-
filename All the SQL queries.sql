@@ -107,3 +107,21 @@ WITH CHECK (auth.uid() = id OR auth.role() = 'admin');
 CREATE POLICY "users_delete_own"
 ON users FOR DELETE TO authenticated
 USING (auth.uid() = id OR auth.role() = 'admin');
+
+
+-- updated the polices for RLS 
+CREATE OR REPLACE FUNCTION delete_all_activity_logs()
+RETURNS void AS $$
+BEGIN
+  DELETE FROM public.employee_activity_logs;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- updated the polices for RLS -- 
+CREATE OR REPLACE FUNCTION delete_all_activity_logs()
+RETURNS void AS $$
+BEGIN
+  DELETE FROM public.employee_activity_logs WHERE true;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
